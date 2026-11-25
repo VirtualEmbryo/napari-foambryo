@@ -1,0 +1,263 @@
+# The test suite on Linux, Python 3.12 and 3.13, with the newest releases of the dependencies
+# ("current", resolved when the job runs) and with the lower bounds pinned exactly ("floor"),
+# with the testing extra and PyQt6 (the plugin declares no Qt binding; the jobs use PyQt6's newest
+# release). Qt runs on its offscreen platform (QT_QPA_PLATFORM=offscreen): the tests drive the
+# widgets on a napari ViewerModel, without a window; the tests marked `opengl` need a real window
+# and skip.
+#
+# The floor pins the declared lower bounds of the whole stack, and nothing else: the plugin's own
+# (napari 0.9.0, magicgui 0.7.0, qtpy 2.4.0, superqt 0.7.8, numpy 2.0.0, scipy 1.14.0,
+# matplotlib 3.8.4, psutil 5.9.4), foambryo's (networkx 3.2, trimesh 4.0.0, and tifffile 2023.1.23
+# of its cli extra; its scipy bound is below the plugin's) and delaunay-watershed's (iorec 1.4.1,
+# scikit-image 0.23.1, edt 2.4.1, meshio 5.3.5). Python 3.13 has no wheel for some lower bounds
+# (numpy 2.0.0, scipy 1.14.0, scikit-image 0.23.1, edt 2.4.1, matplotlib 3.8.4): its floor job pins
+# the oldest release of each that has a CPython 3.13 wheel for Linux, foambryo's choices.
+#
+# This is the workflow of the public release candidate. delaunay-watershed and foambryo 0.8.0 are not on PyPI yet.
+# Until they are, every job, current and floor, builds delaunay-watershed from the public repository
+# VirtualEmbryo/delaunay-watershed, branch release/0.8.0rc1, at one pinned commit (DELAUNAY_WATERSHED_CANDIDATE_COMMIT
+# below); foambryo from the public repository VirtualEmbryo/foambryo, branch release/0.8.0rc1, at one pinned commit
+# (FOAMBRYO_CANDIDATE_COMMIT below). Each is the release candidate published there, and its own CI runs on that
+# commit. delaunay-watershed is a metapackage that requires delaunay-watershed-3d, which carries dw3d, and
+# delaunay-watershed-2d, which carries dw2d, at the same version; all three are built from that one repository. They
+# are resolved together with this package, so that pip check sees them all. No secret is used. At the release this is
+# reverted: the checkout steps go, the install line names the packages alone, and the floor jobs pin the released
+# versions (see the release checklist).
+#
+# Every action is pinned by its commit SHA (the tag in the comment). Pull requests from forks run with
+# the read-only token this file grants (contents: read) and no secret; the workflow never uses
+# pull_request_target.
+#
+# The same jobs run on macOS 15 on Apple silicon (arm64), in the public repository only: macOS
+# runner minutes are billed ten times Linux's in a private repository.
+#
+# It runs on pushes to the default branch and to release branches, on pull requests and by hand
+# (workflow_dispatch), not on other branches, to keep the runner minutes low.
+
+name: Test suites on Linux and macOS
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The commit of the public delaunay-watershed's branch release/0.8.0rc1 every job installs (full SHA);
+  # see the header.
+  DELAUNAY_WATERSHED_CANDIDATE_COMMIT: 98a9481e228acdcbb29894bd93997a064a03d232
+  # The commit of the public foambryo's branch release/0.8.0rc1 every job installs (full SHA);
+  # see the header.
+  FOAMBRYO_CANDIDATE_COMMIT: 5aedb674b7e5675cc3bca8d117a7c22dc8e0a83c
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }}, ${{ matrix.dependencies }} dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.12"
+            dependencies: current
+            pins: ""
+          - python: "3.12"
+            dependencies: floor
+            pins: >-
+              napari==0.9.0 magicgui==0.7.0 qtpy==2.4.0 superqt==0.7.8 psutil==5.9.4
+              numpy==2.0.0 matplotlib==3.8.4
+              scipy==1.14.0 networkx==3.2 trimesh==4.0.0 tifffile==2023.1.23
+              iorec==1.4.1 scikit-image==0.23.1 edt==2.4.1 meshio==5.3.5
+          - python: "3.13"
+            dependencies: current
+            pins: ""
+          - python: "3.13"
+            dependencies: floor
+            pins: >-
+              napari==0.9.0 magicgui==0.7.0 qtpy==2.4.0 superqt==0.7.8 psutil==5.9.4
+              numpy==2.1.0 matplotlib==3.9.2
+              scipy==1.14.1 networkx==3.2 trimesh==4.0.0 tifffile==2023.1.23
+              iorec==1.4.1 scikit-image==0.25.0 edt==3.0.0 meshio==5.3.5
+    env:
+      PINS: ${{ matrix.pins }}
+      JOB_LABEL: Python ${{ matrix.python }}, ${{ matrix.dependencies }} dependencies
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: delaunay-watershed at the pinned commit of its public release candidate branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: VirtualEmbryo/delaunay-watershed
+          ref: ${{ env.DELAUNAY_WATERSHED_CANDIDATE_COMMIT }}
+          path: delaunay-watershed-at-the-pinned-commit
+          persist-credentials: false
+      - name: foambryo at the pinned commit of its public release candidate branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: VirtualEmbryo/foambryo
+          ref: ${{ env.FOAMBRYO_CANDIDATE_COMMIT }}
+          path: foambryo-at-the-pinned-commit
+          persist-credentials: false
+      - name: System libraries that Qt loads
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libfontconfig1 libdbus-1-3 libglib2.0-0t64
+      - name: Install the plugin, the libraries, the testing extra and PyQt6
+        run: |
+          set -euo pipefail
+          printf '%s\n' ${PINS} > "${RUNNER_TEMP}/constraints.txt"
+          python -m pip install --upgrade pip
+          python -m pip install --only-binary=:all: --constraint "${RUNNER_TEMP}/constraints.txt" \
+            "./delaunay-watershed-at-the-pinned-commit" "./delaunay-watershed-at-the-pinned-commit/distributions/delaunay-watershed-2d" \
+            "./delaunay-watershed-at-the-pinned-commit/distributions/delaunay-watershed" "./foambryo-at-the-pinned-commit[cli]" \
+            ".[testing]" PyQt6
+          python -m pip check
+          python -m pip freeze --all
+      - name: Run the test suite
+        run: |
+          set -uo pipefail
+          python -m pytest -q -rs -p no:cacheprovider --junitxml "${RUNNER_TEMP}/junit.xml" tests 2>&1 | tee "${RUNNER_TEMP}/pytest-output.txt"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### ${JOB_LABEL}"
+            python -c 'import importlib.metadata as m; print(", ".join(f"{p} {m.version(p)}" for p in ["foambryo", "delaunay-watershed", "delaunay-watershed-3d", "delaunay-watershed-2d", "napari", "numpy", "scipy", "PyQt6"]))'
+            echo
+            tail -n 1 "${RUNNER_TEMP}/pytest-output.txt"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Passed, skipped and failed counts
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          python - "${RUNNER_TEMP}/junit.xml" <<'PYTHON' | tee -a "${GITHUB_STEP_SUMMARY}"
+          # One line of counts from pytest's own report, and the reason of every skip: a change in the skip count
+          # is a finding.
+          import sys
+          import xml.etree.ElementTree as ElementTree
+          from collections import Counter
+
+          count, skipped = Counter(), []
+          for case in ElementTree.parse(sys.argv[1]).iter("testcase"):
+              outcome = next((c.tag for c in case if c.tag in ("skipped", "failure", "error")), "passed")
+              count[outcome] += 1
+              if outcome == "skipped":
+                  skipped.append(f"skipped: {case.get('classname')}.{case.get('name')}: {case.find('skipped').get('message')}")
+          names = {"passed": "passed", "skipped": "skipped", "failure": "failed", "error": "errors"}
+          print("\n".join(["", *skipped, "", ", ".join(f"{count[k]} {v}" for k, v in names.items())]))
+          PYTHON
+
+  tests-macos:
+    name: macOS arm64, Python ${{ matrix.python }}, ${{ matrix.dependencies }} dependencies
+    # Public repository only (see the header). The steps and pins are the Linux job's, without the
+    # apt step; keep them in step with it.
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.12"
+            dependencies: current
+            pins: ""
+          - python: "3.12"
+            dependencies: floor
+            pins: >-
+              napari==0.9.0 magicgui==0.7.0 qtpy==2.4.0 superqt==0.7.8 psutil==5.9.4
+              numpy==2.0.0 matplotlib==3.8.4
+              scipy==1.14.0 networkx==3.2 trimesh==4.0.0 tifffile==2023.1.23
+              iorec==1.4.1 scikit-image==0.23.1 edt==2.4.1 meshio==5.3.5
+          - python: "3.13"
+            dependencies: current
+            pins: ""
+          - python: "3.13"
+            dependencies: floor
+            pins: >-
+              napari==0.9.0 magicgui==0.7.0 qtpy==2.4.0 superqt==0.7.8 psutil==5.9.4
+              numpy==2.1.0 matplotlib==3.9.2
+              scipy==1.14.1 networkx==3.2 trimesh==4.0.0 tifffile==2023.1.23
+              iorec==1.4.1 scikit-image==0.25.0 edt==3.0.0 meshio==5.3.5
+    env:
+      PINS: ${{ matrix.pins }}
+      JOB_LABEL: macOS arm64, Python ${{ matrix.python }}, ${{ matrix.dependencies }} dependencies
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: delaunay-watershed at the pinned commit of its public release candidate branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: VirtualEmbryo/delaunay-watershed
+          ref: ${{ env.DELAUNAY_WATERSHED_CANDIDATE_COMMIT }}
+          path: delaunay-watershed-at-the-pinned-commit
+          persist-credentials: false
+      - name: foambryo at the pinned commit of its public release candidate branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: VirtualEmbryo/foambryo
+          ref: ${{ env.FOAMBRYO_CANDIDATE_COMMIT }}
+          path: foambryo-at-the-pinned-commit
+          persist-credentials: false
+      - name: Install the plugin, the libraries, the testing extra and PyQt6
+        run: |
+          set -euo pipefail
+          printf '%s\n' ${PINS} > "${RUNNER_TEMP}/constraints.txt"
+          python -m pip install --upgrade pip
+          python -m pip install --only-binary=:all: --constraint "${RUNNER_TEMP}/constraints.txt" \
+            "./delaunay-watershed-at-the-pinned-commit" "./delaunay-watershed-at-the-pinned-commit/distributions/delaunay-watershed-2d" \
+            "./delaunay-watershed-at-the-pinned-commit/distributions/delaunay-watershed" "./foambryo-at-the-pinned-commit[cli]" \
+            ".[testing]" PyQt6
+          python -m pip check
+          python -m pip freeze --all
+      - name: Run the test suite
+        run: |
+          set -uo pipefail
+          python -m pytest -q -rs -p no:cacheprovider --junitxml "${RUNNER_TEMP}/junit.xml" tests 2>&1 | tee "${RUNNER_TEMP}/pytest-output.txt"
+          status=${PIPESTATUS[0]}
+          {
+            echo "### ${JOB_LABEL}"
+            python -c 'import importlib.metadata as m; print(", ".join(f"{p} {m.version(p)}" for p in ["foambryo", "delaunay-watershed", "delaunay-watershed-3d", "delaunay-watershed-2d", "napari", "numpy", "scipy", "PyQt6"]))'
+            echo
+            tail -n 1 "${RUNNER_TEMP}/pytest-output.txt"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Passed, skipped and failed counts
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          python - "${RUNNER_TEMP}/junit.xml" <<'PYTHON' | tee -a "${GITHUB_STEP_SUMMARY}"
+          # One line of counts from pytest's own report, and the reason of every skip: a change in the skip count
+          # is a finding.
+          import sys
+          import xml.etree.ElementTree as ElementTree
+          from collections import Counter
+
+          count, skipped = Counter(), []
+          for case in ElementTree.parse(sys.argv[1]).iter("testcase"):
+              outcome = next((c.tag for c in case if c.tag in ("skipped", "failure", "error")), "passed")
+              count[outcome] += 1
+              if outcome == "skipped":
+                  skipped.append(f"skipped: {case.get('classname')}.{case.get('name')}: {case.find('skipped').get('message')}")
+          names = {"passed": "passed", "skipped": "skipped", "failure": "failed", "error": "errors"}
+          print("\n".join(["", *skipped, "", ", ".join(f"{count[k]} {v}" for k, v in names.items())]))
+          PYTHON

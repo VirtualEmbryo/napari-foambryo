@@ -27,7 +27,6 @@ def test_a_leading_axis_of_length_1_is_dropped_and_said():
     ("data", "message"),
     [
         (np.zeros((3, 4, 5, 6), dtype=np.uint16), "3 time points"),
-        (np.zeros((4, 5), dtype=np.uint16), "2-D"),
         (np.zeros((4, 5, 6)), "float64"),
         (np.zeros((4, 5, 6), dtype=bool), "bool"),
         (-np.ones((4, 5, 6), dtype=np.int16), "negative"),
@@ -36,6 +35,16 @@ def test_a_leading_axis_of_length_1_is_dropped_and_said():
 def test_what_is_refused_says_why(data, message):
     with pytest.raises(SegmentationMaskError, match=message):
         prepare_mask(data)
+
+
+def test_a_2d_layer_and_one_plane_are_2d_masks():
+    flat = np.zeros((4, 5), dtype=np.uint16)
+    flat[1:3, 1:4] = 1
+    assert prepare_mask(flat).mask.shape == (4, 5)
+    prepared = prepare_mask(flat[None], name="'seg'")
+    assert prepared.mask.shape == (4, 5)
+    assert prepared.dropped_leading_axis
+    assert "the 2-D mask (4, 5) is meshed in 2D" in prepared.notes[0]
 
 
 def test_multiscale_reads_the_full_resolution_and_lazy_arrays_are_read():

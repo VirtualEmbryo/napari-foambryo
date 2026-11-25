@@ -8,6 +8,8 @@ in the public repository, and the package metadata names that repository (napari
 import re
 import tomllib
 
+from packaging.version import Version  # pytest's own dependency
+
 from tests.conftest import REPOSITORY
 
 PUBLIC_REPOSITORY = "https://github.com/VirtualEmbryo/napari-foambryo"
@@ -22,12 +24,17 @@ def test_every_readme_image_and_link_is_absolute() -> None:
 
 
 def test_the_readme_images_are_pinned_to_this_versions_tag() -> None:
-    version = tomllib.loads((REPOSITORY / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    """A release's images point to its tag; a release candidate's to the tag of the release it precedes.
+
+    A candidate (0.2.0rc1) ships the release's README unchanged, so its images point to `v0.2.0`; a development
+    version is not checked.
+    """
+    version = Version(tomllib.loads((REPOSITORY / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])
     readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
     images = re.findall(r"!\[[^\]]*\]\(([^)\s]+)", readme)
     assert images
-    pinned = f"https://raw.githubusercontent.com/VirtualEmbryo/napari-foambryo/v{version}/"
-    if ".dev" not in version:
+    pinned = f"https://raw.githubusercontent.com/VirtualEmbryo/napari-foambryo/v{version.base_version}/"
+    if not version.is_devrelease:
         for image in images:
             assert image.startswith(pinned), image
 

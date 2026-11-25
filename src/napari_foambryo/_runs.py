@@ -6,8 +6,8 @@ foambryo's own writers (`foambryo.results`), so that the folder can be reproduce
 * `mesh.rec`: the reconstruction's `.rec` bytes, which are `foambryo mesh`'s file for the same mask and options;
 * `tensions.csv`, `pressures.csv` (not with the tensions only): exact floats; with diagnostics, `solves.csv` (one
   row per linear solve) and, with the spectrum, `spectra.npz`;
-* `run.json`: schema 1 of the command's run record, plus `source_mask`, `equivalent_commands`, and napari's and the
-  plugin's versions;
+* `run.json`: the command's run record (schema 2, `foambryo.results.RUN_RECORD_SCHEMA`), plus `source_mask`,
+  `equivalent_commands`, and napari's and the plugin's versions;
 * `colour_bars.png`: `foambryo.colour_scales.save_colour_bars` on the values shown;
 * `mask.npz` (on request, and always when the medium label was swapped): what `foambryo mesh` reads.
 """
@@ -63,7 +63,7 @@ class SourceMask:
     shape: tuple[int, ...]
     dtype: str
     sha256: str
-    spacing: tuple[float, float, float]
+    spacing: tuple[float, ...]
     spacing_unit: str
     spacing_from: str
     medium_label: int = 0
@@ -98,7 +98,9 @@ class InferenceOptions:
     """The Infer widget's options, by the command's spellings (`foambryo.results.option_name`).
 
     `pressures=False` is the tensions only (`foambryo infer --no-pressures`): the pressure method and base pressure
-    are then not used, and are recorded as `None`, as the command records them.
+    are then not used, and are recorded as `None`, as the command records them. `angle_reading=None` is the
+    library's default of the mesh's dimension (`chord` in 3D, `arc` in 2D); another reading is passed to the library,
+    recorded and given to the command (`--angle-reading`), as `foambryo infer` does.
     """
 
     tension_method: str
@@ -108,6 +110,7 @@ class InferenceOptions:
     solver: str
     diagnostics: str
     pressures: bool = True
+    angle_reading: str | None = None
 
     def as_record(self) -> dict[str, Any]:
         """The `options` entry of `run.json`, as `foambryo infer` writes it."""
@@ -118,7 +121,10 @@ class InferenceOptions:
             "base_pressure": self.base_pressure,
             "solver": self.solver,
             "diagnostics": self.diagnostics,
+            "media": None,  # as `foambryo infer` records it without --media (the mesh's own media are in `mesh`)
         }
+        if self.angle_reading is not None:
+            record["angle_reading"] = self.angle_reading
         if not self.pressures:
             record.update(pressure_method=None, base_pressure=None, no_pressures=True)
         return record
@@ -137,9 +143,11 @@ class InferenceOptions:
             if self.pressures
             else ["--no-pressures", "--mean-tension", repr(self.mean_tension)]
         )
+        reading = [] if self.angle_reading is None else ["--angle-reading", self.angle_reading]
         return [
             "--tension-method",
             self.tension_method,
+            *reading,
             *pressure,
             "--solver",
             self.solver,
@@ -256,6 +264,7 @@ def infer_on_mesh(mesh: DcelData, options: InferenceOptions) -> tuple[InferenceO
             solver=options.solver,
             diagnostics=tables.DIAGNOSTICS[options.diagnostics],
             with_pressures=options.pressures,
+            **({} if options.angle_reading is None else {"angle_reading": options.angle_reading}),
         )
     return outcome, collector.summary, time.perf_counter() - started
 
@@ -274,6 +283,8 @@ class Run:
         rec_name: the opened file's name, for a mesh opened from a file.
         reconstruct_warnings: the reconstruction's warnings.
         reconstruct_seconds, peak_rss_bytes: the reconstruction's time and peak memory.
+        pad_thin_medium_margins: the reconstruction's padding of thin medium margins as chosen in the dock: `None`,
+            delaunay-watershed's default, or on or off (`foambryo mesh --pad-thin-medium-margins`).
         options, outcome, infer_warnings, infer_seconds, infer_date: the last inference.
         out_of_date: the source layer changed after the reconstruction.
     """
@@ -288,6 +299,7 @@ class Run:
     reconstruct_warnings: list = field(default_factory=list)
     reconstruct_seconds: float = 0.0
     peak_rss_bytes: int = 0
+    pad_thin_medium_margins: bool | None = None
     options: InferenceOptions | None = None
     outcome: InferenceOutcome | None = None
     infer_warnings: list = field(default_factory=list)
@@ -311,6 +323,8 @@ class Run:
             commands.append(
                 f"foambryo mesh {MASK_FILE} -o {MESH_FILE} --spacing {spacing} --spacing-unit {unit} "
                 f"--min-distance {self.reconstruction.min_distance}"
+                + {None: "", True: " --pad-thin-medium-margins",
+                   False: " --no-pad-thin-medium-margins"}[self.pad_thin_medium_margins]
             )
         if self.options is not None:
             commands.append(" ".join(["foambryo infer", MESH_FILE, "-o", ".", *self.options.command_arguments()]))
@@ -440,6 +454,9 @@ def export_run(run: Run, folder: Path, *, include_mask: bool = False, overwrite:
             "seconds": round(run.reconstruct_seconds, 3),
             "peak_rss_bytes": run.peak_rss_bytes,
             "warnings": run.reconstruct_warnings,
+            # only when chosen in the dock: a default run's record is as before
+            **({} if run.pad_thin_medium_margins is None
+               else {"pad_thin_medium_margins": run.pad_thin_medium_margins}),
         }
     )
     record["equivalent_commands"] = run.equivalent_commands()

@@ -15,6 +15,8 @@ import pytest
 from dw3d import get_default_mesh_reconstruction_algorithm
 from foambryo import infer_forces
 from foambryo import results as tables
+from foambryo.io import default_min_distance
+from foambryo.pressure_inference import default_pressure_method
 
 from napari_foambryo._layers import RUNS
 from napari_foambryo._sample_data import benchmark_case_000, foam_anisotropic, foam_cropped, foam_cubic
@@ -74,13 +76,13 @@ def _infer(qtbot, infer) -> None:
 
 def test_widget_defaults_are_the_librarys(docks):
     reconstruct, infer, _, _ = docks
-    assert (
-        reconstruct.min_distance.value()
-        == inspect.signature(get_default_mesh_reconstruction_algorithm).parameters["min_distance"].default
-    )
+    # The library's defaults that depend on the dimension are None; with no layer, the docks show the 3-D ones.
+    assert inspect.signature(get_default_mesh_reconstruction_algorithm).parameters["min_distance"].default is None
+    assert reconstruct.min_distance.value() == default_min_distance(3)
     signature = inspect.signature(infer_forces).parameters
     assert tables.TENSION_METHODS[infer.tension_box.currentText()] is signature["mode_tension"].default
-    assert tables.PRESSURE_METHODS[infer.pressure_box.currentText()] is signature["mode_pressure"].default
+    assert signature["mode_pressure"].default is None
+    assert tables.PRESSURE_METHODS[infer.pressure_box.currentText()] is default_pressure_method(3)
     assert float(infer.mean_tension.text()) == signature["mean_tension"].default
     assert float(infer.base_pressure.text()) == signature["base_pressure"].default
     assert infer.solver_box.currentText() == signature["solver"].default
