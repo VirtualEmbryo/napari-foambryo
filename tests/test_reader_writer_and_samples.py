@@ -73,4 +73,4 @@ def test_the_manifest_is_valid():
         "Export",
         "View",
     }
-    assert len(manifest.contributions.sample_data) == 4
+    assert len(manifest.contributions.sample_data) == 8  # four 3-D, four 2-D

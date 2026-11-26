@@ -1,13 +1,13 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite the article in preferred-citation."
+message: "If you use this software, please cite both the article in preferred-citation (Nature Methods 2023) and the Developmental Cell 2026 article in references."
 type: software
 title: "napari-foambryo"
-abstract: "Surface tensions and cell pressures of a 3-D segmentation, in napari: delaunay-watershed-3d and foambryo."
+abstract: "Surface tensions and cell pressures of a 2-D or 3-D segmentation, in napari: delaunay-watershed and foambryo."
 authors:
   - given-names: Hervé
     family-names: Turlier
-version: 0.1.0
-date-released: 2026-10-17
+version: 0.2.0
+date-released: 2026-11-26
 license: GPL-3.0-or-later
 preferred-citation:
   type: article
@@ -32,3 +32,33 @@ preferred-citation:
   month: 12
   doi: "10.1038/s41592-023-02084-7"
   issn: "1548-7105"
+references:
+  - type: article
+    title: "Spatiotemporal mapping of the contractile and adhesive forces sculpting early C. elegans embryos"
+    notes: "Please cite it with the preferred citation; the reference of the two-dimensional inference of tensions and pressures, and the data of the C. elegans sample frames (Zenodo, doi:10.5281/zenodo.19627642, CC BY-SA 4.0)."
+    authors:
+      - given-names: Kazunori
+        family-names: Yamamoto
+      - given-names: Sacha
+        family-names: Ichbiah
+      - given-names: Matthieu
+        family-names: Perez
+      - given-names: Joana
+        family-names: Borrego-Pinto
+      - given-names: Fabrice
+        family-names: Delbary
+      - given-names: Nathan W.
+        family-names: Goehring
+      - given-names: Paul
+        family-names: Northrop
+      - given-names: Hervé
+        family-names: Turlier
+      - given-names: Guillaume
+        family-names: Charras
+    journal: "Developmental Cell"
+    volume: 61
+    issue: 6
+    start: 1273
+    end: "1288.e4"
+    year: 2026
+    doi: "10.1016/j.devcel.2026.04.013"

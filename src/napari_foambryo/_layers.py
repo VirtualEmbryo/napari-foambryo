@@ -20,6 +20,13 @@ tensions layer, and `<base> undetermined tensions` draws its triangles' edges in
 (a wireframe over transparent faces); crop faces are `<base> crop faces`, see-through glass with their edges drawn
 (the library's crop-face colours), and are left out of the pressure layers.
 
+**2-D meshes** are drawn as 2-D Surface layers in the image's own frame `(row, column)`, over the Labels layer: the
+cells as filled polygons (`<base> pressures`, each cell in its pressure's colour), the interfaces as ribbons one pixel
+wide (`<base> interfaces` before the inference, in dark grey; `<base> tensions` after, each interface in its tension's
+colour, an undetermined one in the library's undetermined green), and the segments that close a cut cell along the
+image border (`<base> image border`, no value, in the crop faces' edge colour). Explode moves each cell by its area
+centroid's offset from the tissue's; there is no cut in 2D.
+
 **Off the GUI thread.** Building a layer's display copy and colours (`prepare_*`, numpy only, no napari) is what takes
 time on a large tissue; the docks run it in a worker thread, then `install_layers` hands the arrays to napari on the
 GUI thread. `add_mesh_layers`, `add_result_layers` and `add_ensemble_layer` do both at once.
@@ -41,6 +48,11 @@ from napari_foambryo._display import (
     exploded_vertices,
     interface_copy,
     interface_side_copy,
+    is_planar,
+    planar_cell_copy,
+    planar_directions,
+    planar_interface_copy,
+    planar_scene_of,
     pressure_copy,
     pressure_vertex_colours,
     scattered_directions,
@@ -76,6 +88,12 @@ RUNS: dict[str, Run] = {}
 _COUNTER = itertools.count(1)
 #: Each run's displacement directions (`_display.scattered_directions`), computed on first use.
 _DIRECTIONS: dict[str, np.ndarray] = {}
+#: Each 2-D run's drawing (`_display.planar_scene_of`: cells as triangles, interfaces, border), computed on first use.
+_SCENES: dict[str, object] = {}
+#: A 2-D mesh's interfaces before the inference: dark grey ribbons.
+MESH_INTERFACE_RGBA = (0.12, 0.12, 0.12, 1.0)
+#: The image-border segments of a 2-D mesh: the crop faces' edge colour (no value).
+BORDER_RGBA = (*(float(c) for c in CROP_FACE_EDGE_COLOR), 1.0)
 
 #: Crop faces are the library's glass: its fill at its opacity in the vertex colours (so that the edges, drawn by the
 #: layer's wireframe, stay opaque), its edge colour.
@@ -104,17 +122,43 @@ def run_of_layer(layer: Any) -> Run | None:  # noqa: ANN401 - a napari layer
     return RUNS.get(info.get("run_id", ""))
 
 
-def _frame(source_layer: Any, spacing_used: tuple[float, float, float] | None) -> dict[str, Any]:  # noqa: ANN401
+def _frame(
+    source_layer: Any,  # noqa: ANN401
+    spacing_used: tuple[float, ...] | None,
+    ndim: int = 3,
+) -> dict[str, Any]:
+    """The Surface layers' scale and translate: on the Labels layer's voxels (or pixels), else the identity."""
     if source_layer is None or spacing_used is None:
-        return {"scale": (1.0, 1.0, 1.0), "translate": (0.0, 0.0, 0.0)}
-    scale = np.asarray(source_layer.scale[-3:], dtype=np.float64) / np.asarray(spacing_used, dtype=np.float64)
-    return {"scale": tuple(float(v) for v in scale), "translate": tuple(float(v) for v in source_layer.translate[-3:])}
+        return {"scale": (1.0,) * ndim, "translate": (0.0,) * ndim}
+    ndim = len(spacing_used)
+    scale = np.asarray(source_layer.scale[-ndim:], dtype=np.float64) / np.asarray(spacing_used, dtype=np.float64)
+    return {"scale": tuple(float(v) for v in scale),
+            "translate": tuple(float(v) for v in source_layer.translate[-ndim:])}
+
+
+def run_ndim(run: Run) -> int:
+    """2 for a run on a 2-D mesh, else 3."""
+    return 2 if is_planar(run.mesh) else 3
+
+
+def _scene(run: Run) -> object:
+    if run.run_id not in _SCENES:
+        _SCENES[run.run_id] = planar_scene_of(run.mesh)
+    return _SCENES[run.run_id]
 
 
 def _directions(run: Run) -> np.ndarray:
     if run.run_id not in _DIRECTIONS:
-        _DIRECTIONS[run.run_id] = scattered_directions(run.mesh)
+        _DIRECTIONS[run.run_id] = (planar_directions(run.mesh, _scene(run)) if is_planar(run.mesh)
+                                   else scattered_directions(run.mesh))
     return _DIRECTIONS[run.run_id]
+
+
+def _materials(run: Run) -> np.ndarray:
+    """Every label of the run's mesh (0 included when present)."""
+    if is_planar(run.mesh):
+        return np.unique(np.asarray(run.mesh.labels, dtype=np.int64))
+    return np.unique(np.asarray(run.mesh.f[:, 3:5], dtype=np.int64))
 
 
 def _set_surface(
@@ -195,7 +239,12 @@ def _exploded(run: Run, layer: PreparedLayer, explode: float) -> PreparedLayer:
 def prepare_mesh_layers(
     run: Run, base_name: str, palette: dict[int, np.ndarray] | None = None, *, explode: float = 0.0
 ) -> list[PreparedLayer]:
-    """`<base> cells` (each cell in its Labels colour, from `palette`) and `<base> crop faces` (glass). No napari."""
+    """`<base> cells` (each cell in its Labels colour, from `palette`) and `<base> crop faces` (glass). No napari.
+
+    A 2-D mesh: `<base> interfaces` (dark grey ribbons) and `<base> image border` (when a cell is cut by the image).
+    """
+    if is_planar(run.mesh):
+        return [_exploded(run, layer, explode) for layer in _planar_mesh_layers(run, base_name, explode > 0)]
     cells = cell_side_copy(run.mesh)
     if palette is not None and len(cells.vertex_group):
         colours = np.stack([palette[int(g)] for g in cells.vertex_group])
@@ -210,17 +259,45 @@ def prepare_mesh_layers(
     return [_exploded(run, layer, explode) for layer in prepared]
 
 
+def _planar_mesh_layers(run: Run, base_name: str, exploded: bool) -> list[PreparedLayer]:
+    """A 2-D mesh before the inference: its interfaces (dark grey ribbons) and its image-border segments."""
+    scene = _scene(run)
+    interfaces, keys = planar_interface_copy(run.mesh, scene, exploded=exploded)
+    colours = np.tile(np.asarray(MESH_INTERFACE_RGBA, dtype=np.float32), (len(interfaces.vertices), 1))
+    prepared = [PreparedLayer(f"{base_name} interfaces", "interfaces", interfaces, colours, {"interfaces": keys})]
+    border = _planar_border_layer(run, base_name)
+    return prepared if border is None else [*prepared, border]
+
+
+def _planar_border_layer(run: Run, base_name: str) -> PreparedLayer | None:
+    scene = _scene(run)
+    if not np.any(scene.border):
+        return None
+    border, _ = planar_interface_copy(run.mesh, scene, border=True)
+    colours = np.tile(np.asarray(BORDER_RGBA, dtype=np.float32), (len(border.vertices), 1))
+    return PreparedLayer(f"{base_name} image border", "image border", border, colours)
+
+
 def _palette_of(source_layer: Any, run: Run) -> dict[int, np.ndarray] | None:  # noqa: ANN401 - a Labels layer
     """The Labels layer's colour of each cell, read on the GUI thread (napari's colormap), or `None`."""
     if source_layer is None or not hasattr(source_layer, "get_color"):
         return None
-    labels = np.unique(np.asarray(run.mesh.f[:, 3:5], dtype=np.int64))
+    labels = _materials(run)
     return {int(g): np.asarray(source_layer.get_color(int(g)), dtype=np.float32) for g in labels if g > 0}
 
 
 def _tension_layers(run: Run, base_name: str, name: str, kind: str, tensions: dict, pressures: dict | None,
                     exploded: bool) -> list[PreparedLayer]:
-    """A tensions layer, and its undetermined interfaces' wireframe when there are any."""
+    """A tensions layer, and its undetermined interfaces' wireframe when there are any.
+
+    In 2D, the interfaces' ribbons, an undetermined one in the undetermined green (a ribbon has no fill to leave out).
+    """
+    if is_planar(run.mesh):
+        copy, keys = planar_interface_copy(run.mesh, _scene(run), exploded=exploded)
+        values, colours = tension_vertex_colours(run.mesh, copy, keys, tensions, pressures)
+        colours[np.isnan(values), 3] = 1.0
+        return [PreparedLayer(name, kind, copy, colours, {"interfaces": keys, "base_colours": colours,
+                                                          "values": values})]
     copy, keys = interface_side_copy(run.mesh) if exploded else interface_copy(run.mesh)
     values, colours = tension_vertex_colours(run.mesh, copy, keys, tensions, pressures)
     prepared = [PreparedLayer(name, kind, copy, colours, {"interfaces": keys, "base_colours": colours,
@@ -239,8 +316,14 @@ def outline_layer_name(tension_layer_name: str) -> str:
 
 
 def _pressure_layer(run: Run, name: str, tensions: dict, pressures: dict, exploded: bool) -> PreparedLayer:
-    """Per higher-labelled material as `foambryo view` draws it; exploded, per cell side. One scale either way."""
-    copy = cell_side_copy(run.mesh, with_crop_faces=False) if exploded else pressure_copy(run.mesh)
+    """Per higher-labelled material as `foambryo view` draws it; exploded, per cell side. One scale either way.
+
+    In 2D, each cell as its filled polygon, exploded or not.
+    """
+    if is_planar(run.mesh):
+        copy = planar_cell_copy(run.mesh, _scene(run))
+    else:
+        copy = cell_side_copy(run.mesh, with_crop_faces=False) if exploded else pressure_copy(run.mesh)
     values, colours = pressure_vertex_colours(run.mesh, copy, tensions, pressures)
     return PreparedLayer(name, "pressures", copy, colours, {"base_colours": colours, "values": values})
 
@@ -273,7 +356,7 @@ def install_layers(
     spacing_used: tuple[float, float, float] | None = None,
 ) -> list[str]:
     """Show prepared layers in napari (on the GUI thread): each updated in place when it is this run's, else added."""
-    frame = _frame(source_layer, spacing_used)
+    frame = _frame(source_layer, spacing_used, run_ndim(run))
     names = []
     drawn = {layer.name for layer in prepared}
     for layer in prepared:  # a tensions layer drawn now without undetermined interfaces loses its earlier outlines
@@ -349,7 +432,8 @@ def highlight(viewer: Any, layer: Any, group: int | None) -> None:  # noqa: ANN4
     if selected.any():
         centre = layer.data[0][selected].mean(axis=0)
         world = centre * np.asarray(layer.scale) + np.asarray(layer.translate)
-        viewer.camera.center = tuple(float(v) for v in world)
+        # `viewer.scene.camera`: napari deprecated `viewer.camera` in 0.9.0, the minimum, which has the replacement.
+        viewer.scene.camera.center = tuple(float(v) for v in world)
 
 
 def _label_palette(groups: np.ndarray) -> np.ndarray:
@@ -411,9 +495,13 @@ def prepare_explode(
     now = explode > 0
     prepared: dict[str, PreparedLayer] = {}
     for name, kind, current in targets:
-        if (current > 0) == now or kind not in ("tensions", "pressures", "ensemble tensions"):
+        if (current > 0) == now or kind not in ("tensions", "pressures", "ensemble tensions", "interfaces"):
             continue
-        if kind == "ensemble tensions":
+        if kind == "interfaces":
+            layers = [layer for layer in _planar_mesh_layers(run, base_name, now) if layer.kind == "interfaces"]
+            for layer in layers:
+                layer.name = name
+        elif kind == "ensemble tensions":
             layers = _tension_layers(run, base_name, name, kind, run.ensemble.tensions, None, now)
         elif kind == "tensions":
             layers = _tension_layers(run, base_name, name, kind, run.outcome.tensions, run.outcome.pressures, now)
@@ -472,9 +560,9 @@ def explode_layers(
 def _base_name_of(layers: list) -> str:
     """The run's layer names' stem, from its tensions or cells layer."""
     for layer in layers:
-        for suffix in (" tensions", " cells"):
+        for suffix in (" tensions", " cells", " interfaces"):
             kind = layer.metadata.get("foambryo", {}).get("kind")
-            if kind in ("tensions", "cells") and layer.name.endswith(suffix):
+            if kind in ("tensions", "cells", "interfaces") and layer.name.endswith(suffix):
                 return layer.name[: -len(suffix)]
     return ""
 

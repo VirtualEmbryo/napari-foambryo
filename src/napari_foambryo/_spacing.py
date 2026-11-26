@@ -9,6 +9,9 @@
 
 The spacing is then checked as the library checks it (`dw3d.mask_preprocessing.coarse_axis_and_factor`: one axis
 may be longer than the other two, which must be equal), and an anisotropic one is announced with its cost.
+
+A 2-D mask takes a pixel size `(dy, dx)` the same way: the last two entries of the layer's `scale`, or two typed
+numbers; its pixels must be square (`dy == dx`: the library meshes square pixels only).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ __all__ = ["SpacingChoice", "layer_spacing", "resolve_spacing"]
 THIS_LAYER = "this layer"
 TYPED = "typed"
 VOXEL_UNIT = "voxel"
+PIXEL_UNIT = "pixel"
 
 
 @dataclass(frozen=True)
@@ -31,7 +35,7 @@ class SpacingChoice:
     """The spacing to use, or why there is none yet.
 
     Attributes:
-        spacing: `(dz, dy, dx)`.
+        spacing: `(dz, dy, dx)`, or `(dy, dx)` for a 2-D mask.
         unit: its unit.
         spacing_from: what `run.json` records: `"this layer"`, `"layer '<name>'"`, `"typed"`, with how it was known.
         problem: why Run cannot start (`None` when it can).
@@ -52,13 +56,16 @@ def _layer_shape(layer: Any) -> tuple[int, ...]:  # noqa: ANN401
     return tuple(int(n) for n in data.shape)
 
 
-def layer_spacing(layer: Any) -> tuple[tuple[float, float, float], str | None, str | None]:  # noqa: ANN401
-    """A layer's voxel size, its unit (`None` if napari records none) and how it is known (`None`: unknown)."""
-    scale = tuple(float(v) for v in layer.scale[-3:])
+def layer_spacing(layer: Any, ndim: int = 3) -> tuple[tuple[float, ...], str | None, str | None]:  # noqa: ANN401
+    """A layer's voxel (pixel) size, its unit (`None` if napari records none) and how it is known (`None`: unknown).
+
+    `ndim` is the mask's: the last `ndim` entries of the layer's scale.
+    """
+    scale = tuple(float(v) for v in layer.scale[-ndim:])
     info = getattr(layer, "metadata", {}).get("foambryo", {})
     if "spacing" in info and tuple(float(v) for v in info["spacing"]) == scale:
         return scale, str(info.get("spacing_unit", "um")), "the sample's metadata"
-    units = {str(u) for u in tuple(getattr(layer, "units", ()))[-3:]}
+    units = {str(u) for u in tuple(getattr(layer, "units", ()))[-ndim:]}
     unit = units.pop() if len(units) == 1 else None
     unit = None if unit in (None, "pixel") else unit
     if unit is None and all(v == 1.0 for v in scale):
@@ -76,42 +83,61 @@ def resolve_spacing(
     typed_unit: str = "um",
     voxel_units_confirmed: bool = False,
 ) -> SpacingChoice:
-    """Decide the spacing for a reconstruction (see the module's docstring)."""
+    """Decide the spacing for a reconstruction (see the module's docstring).
+
+    `mask_shape` decides the dimension: 3 values for a 3-D mask, 2 for a 2-D one (a `typed` triple then gives its
+    last two values, the pixel size `(dy, dx)`).
+    """
+    ndim = len(mask_shape)
+    ones = (1.0,) * ndim
     if mode == TYPED:
-        if typed is None or len(typed) != 3 or not all(math.isfinite(v) and v > 0 for v in typed):
-            return SpacingChoice((1.0, 1.0, 1.0), typed_unit, TYPED, "type three voxel sizes greater than 0")
+        if typed is not None and ndim == 2 and len(typed) == 3:
+            typed = tuple(typed)[1:]
+        if typed is None or len(typed) != ndim or not all(math.isfinite(v) and v > 0 for v in typed):
+            what = "three voxel sizes" if ndim == 3 else "two pixel sizes"
+            return SpacingChoice(ones, typed_unit, TYPED, f"type {what} greater than 0")
         if not SPACING_UNIT_PATTERN.fullmatch(typed_unit or ""):
             return SpacingChoice(tuple(typed), typed_unit, TYPED, "the unit must be one ASCII word (um, nm, ...)")
         return _checked(SpacingChoice(tuple(float(v) for v in typed), typed_unit, TYPED))
     source = labels if mode == THIS_LAYER else other
     if source is None:
-        return SpacingChoice((1.0, 1.0, 1.0), "um", mode, "choose the layer to take the voxel size from")
-    if source is not labels and _layer_shape(source)[-3:] != tuple(mask_shape):
+        return SpacingChoice(ones, "um", mode, "choose the layer to take the voxel size from")
+    if source is not labels and _layer_shape(source)[-ndim:] != tuple(mask_shape):
         return SpacingChoice(
-            (1.0, 1.0, 1.0),
+            ones,
             "um",
             f"layer '{source.name}'",
-            f"'{source.name}' has the shape {_layer_shape(source)[-3:]}, the labels "
+            f"'{source.name}' has the shape {_layer_shape(source)[-ndim:]}, the labels "
             f"{tuple(mask_shape)}: its voxel size cannot be the labels'",
         )
-    spacing, unit, how = layer_spacing(source)
+    spacing, unit, how = layer_spacing(source, ndim)
     label = THIS_LAYER if source is labels else f"layer '{source.name}'"
     if how is None:
+        unit_name, element = (VOXEL_UNIT, "voxel") if ndim == 3 else (PIXEL_UNIT, "pixel")
         if not voxel_units_confirmed:
             return SpacingChoice(
                 spacing,
-                VOXEL_UNIT,
+                unit_name,
                 label,
-                "voxel size unknown (napari's default scale): enter it, "
-                "take it from the image layer, or confirm voxel units",
+                f"{element} size unknown (napari's default scale): enter it, "
+                f"take it from the image layer, or confirm {element} units",
                 needs_confirmation=True,
             )
-        return _checked(SpacingChoice(spacing, VOXEL_UNIT, f"{label} (voxel units confirmed)"))
+        return _checked(SpacingChoice(spacing, unit_name, f"{label} ({element} units confirmed)"))
     return _checked(SpacingChoice(spacing, unit or "um", f"{label} ({how})"))
 
 
 def _checked(choice: SpacingChoice) -> SpacingChoice:
     from dw3d.mask_preprocessing import coarse_axis_and_factor, isotropic_spacing
+
+    if len(choice.spacing) == 2:
+        dy, dx = choice.spacing
+        spacing_text = " × ".join(f"{v:g}" for v in choice.spacing)
+        if abs(dy - dx) > 1e-6 * max(dy, dx):
+            return SpacingChoice(choice.spacing, choice.unit, choice.spacing_from,
+                                 f"pixels {spacing_text} {choice.unit}: a 2-D mask is meshed with square pixels only")
+        return SpacingChoice(choice.spacing, choice.unit, choice.spacing_from, None, False,
+                             f"pixels {spacing_text} {choice.unit} (square), from {choice.spacing_from}")
 
     try:
         found = coarse_axis_and_factor(choice.spacing)

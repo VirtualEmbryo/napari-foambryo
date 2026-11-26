@@ -1,8 +1,12 @@
 """The dock widgets: Reconstruct, Infer, View, Export and Results.
 
 Every option's default is read from the library function's signature when the widget is built, as the command
-does; advanced options are folded away. Long steps run off the GUI thread: a reconstruction and an inference each in
-a child process that Cancel stops (`_runner`), the layers' display copies in a worker thread. Every warning the library
+does (a default that depends on the dimension, written `None` in the library, is resolved for the mask or mesh in
+hand: `min_distance` 3 voxels or 4 pixels, the pressure method variational or laplace); advanced options are folded
+away. A 2-D Labels layer (or a mesh read from a 2-D `.rec` file) goes through the same docks: meshed in 2D, inferred
+in 2D with the methods offered there, drawn as 2-D layers over the labels. Long steps run off the GUI thread: a
+reconstruction and an inference each in a child process that Cancel stops (`_runner`), the layers' display copies in a
+worker thread. Every warning the library
 raises is listed once, with its count, in the Results dock.
 """
 
@@ -19,6 +23,8 @@ import numpy as np
 from foambryo import infer_forces
 from foambryo import results as tables
 from foambryo.colour_scales import BACKGROUND_COLOURS, save_colour_bars
+from foambryo.io import default_min_distance
+from foambryo.pressure_inference import default_pressure_method
 from foambryo.segmentation_masks import SegmentationMaskError
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QColor, QPixmap
@@ -63,6 +69,7 @@ from napari_foambryo._layers import (
     prepare_mesh_layers,
     prepare_result_layers,
     remove_stale_result_layers,
+    run_ndim,
     world_bounds,
 )
 from napari_foambryo._masks import array_sha256, prepare_mask, swap_medium_label
@@ -92,6 +99,25 @@ def _labels_layers(viewer: Any) -> list:  # noqa: ANN401
     from napari.layers import Labels
 
     return [layer for layer in viewer.layers if isinstance(layer, Labels)]
+
+
+def mask_dimension(layer: Any) -> int:  # noqa: ANN401 - a Labels layer
+    """The dimension of the mask a Labels layer gives (`_masks.prepare_mask`): 2 or 3.
+
+    A leading axis of length 1 is dropped: `(1, Z, Y, X)` gives 3, `(1, Y, X)` gives 2.
+    """
+    data = layer.data[0] if getattr(layer, "multiscale", False) else layer.data
+    shape = tuple(int(n) for n in data.shape)
+    if len(shape) == 4 and shape[0] == 1:
+        shape = shape[1:]
+    if len(shape) == 3 and shape[0] == 1:
+        shape = shape[1:]
+    return 2 if len(shape) == 2 else 3
+
+
+def _mask_shape(layer: Any) -> tuple[int, ...]:  # noqa: ANN401 - a Labels layer
+    data = layer.data[0] if getattr(layer, "multiscale", False) else layer.data
+    return tuple(int(n) for n in data.shape[-mask_dimension(layer):])
 
 
 #: Workers still running, held until they finish: a dock closed meanwhile must not let one be collected half-way.
@@ -138,13 +164,19 @@ def _folded(title: str, content: QWidget) -> QCollapsible:
 # ---------------------------------------------------------------------------------------------
 # Reconstruct
 # ---------------------------------------------------------------------------------------------
+#: The Reconstruct dock's choices for delaunay-watershed's padding of thin medium margins, and what each passes.
+PADDING_CHOICES = (
+    ("delaunay-watershed's default (on for cubic voxels, off when resampled)", None),
+    ("on", True),
+    ("off", False),
+)
+
+
 class ReconstructWidget(QWidget):
     """A Labels layer, its voxel size, the estimate, Run and Cancel."""
 
     def __init__(self, napari_viewer: Any) -> None:  # noqa: ANN401
         """Build the form; defaults are the library's."""
-        from dw3d import get_default_mesh_reconstruction_algorithm
-
         super().__init__()
         self.viewer = napari_viewer
         self.session = session_for(napari_viewer)
@@ -167,7 +199,20 @@ class ReconstructWidget(QWidget):
         self.medium_box.setValue(0)
         self.min_distance = QSpinBox()
         self.min_distance.setRange(1, 1000)
-        self.min_distance.setValue(int(_signature_default(get_default_mesh_reconstruction_algorithm, "min_distance")))
+        # The library's default is per dimension (None): 3 cubic voxels for a 3-D mask, 4 square pixels for a 2-D one.
+        self._dimension = 3
+        self.min_distance.setValue(int(default_min_distance(3)))
+        # delaunay-watershed's padding of thin medium margins: its own default (None), or on or off for this run.
+        self.padding_box = QComboBox()
+        for text, value in PADDING_CHOICES:
+            self.padding_box.addItem(text, value)
+        self.padding_box.setToolTip(
+            "Pad with medium the faces of the image box (sides of a 2-D image) that no cell reaches when their margin "
+            "of medium is thin, so that a cell a few voxels from such a face does not take the medium between them "
+            "(foambryo mesh --pad-thin-medium-margins / --no-pad-thin-medium-margins)."
+        )
+        self.spacing_row_label = QLabel("Voxel size (z, y, x)")
+        self.min_distance_label = QLabel("min_distance (cubic voxels)")
         self.spacing_label = QLabel()
         self.spacing_label.setWordWrap(True)
         self.estimate_label = QLabel()
@@ -195,11 +240,12 @@ class ReconstructWidget(QWidget):
         spacing_row = QHBoxLayout()
         for box in self.spacing_boxes:
             spacing_row.addWidget(box)
-        form.addRow("Voxel size (z, y, x)", spacing_row)
+        form.addRow(self.spacing_row_label, spacing_row)
         form.addRow("Unit", self.unit_edit)
         form.addRow(self.confirm_voxels)
         form.addRow("Medium is label", self.medium_box)
-        form.addRow("min_distance (cubic voxels)", self.min_distance)
+        form.addRow(self.min_distance_label, self.min_distance)
+        form.addRow("Pad thin medium margins", self.padding_box)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.spacing_label)
@@ -245,8 +291,10 @@ class ReconstructWidget(QWidget):
         self.spacing_from.blockSignals(True)
         self.spacing_from.clear()
         self.spacing_from.addItem(THIS_LAYER)
+        labels = self.labels_layer()
+        dimension = 3 if labels is None else mask_dimension(labels)
         for layer in self.viewer.layers:
-            if layer.name != self.layer_box.currentText() and layer.ndim >= 3:
+            if layer.name != self.layer_box.currentText() and layer.ndim >= dimension:
                 self.spacing_from.addItem(f"layer: {layer.name}")
         self.spacing_from.addItem(TYPED)
         if chosen and self.spacing_from.findText(chosen) >= 0:
@@ -276,19 +324,33 @@ class ReconstructWidget(QWidget):
             name = mode.removeprefix("layer: ")
             other = self.viewer.layers[name] if name in self.viewer.layers else None  # noqa: SIM401 - LayerList has no get
             mode = "layer"
-        shape = labels.data[0].shape[-3:] if labels.multiscale else labels.data.shape[-3:]
         return resolve_spacing(
             labels,
             mode,
-            mask_shape=tuple(shape),
+            mask_shape=_mask_shape(labels),
             other=other,
             typed=tuple(box.value() for box in self.spacing_boxes),
             typed_unit=self.unit_edit.text().strip(),
             voxel_units_confirmed=self.confirm_voxels.isChecked(),
         )
 
+    def _follow_the_dimension(self) -> None:
+        """The form for the chosen layer's dimension: three voxel sizes or two pixel sizes, and its min_distance."""
+        labels = self.labels_layer()
+        dimension = 3 if labels is None else mask_dimension(labels)
+        self.spacing_boxes[0].setVisible(dimension == 3)
+        self.spacing_row_label.setText("Voxel size (z, y, x)" if dimension == 3 else "Pixel size (y, x)")
+        self.min_distance_label.setText("min_distance (cubic voxels)" if dimension == 3
+                                        else "min_distance (square pixels)")
+        if dimension != self._dimension:
+            self._dimension = dimension
+            self.min_distance.blockSignals(True)
+            self.min_distance.setValue(int(default_min_distance(dimension)))  # the library's default there
+            self.min_distance.blockSignals(False)
+
     def refresh(self, *_args: Any) -> None:  # noqa: ANN401
         """Recompute the spacing message, the estimate and whether Run is possible."""
+        self._follow_the_dimension()
         typed = self.spacing_from.currentText() == TYPED
         for box in self.spacing_boxes:
             box.setEnabled(typed)
@@ -305,7 +367,7 @@ class ReconstructWidget(QWidget):
         self.confirm_voxels.setVisible(choice.needs_confirmation or self.confirm_voxels.isChecked())
         self._request_report()
         if not typed:
-            for box, value in zip(self.spacing_boxes, choice.spacing, strict=True):
+            for box, value in zip(self.spacing_boxes[-len(choice.spacing):], choice.spacing, strict=True):
                 box.blockSignals(True)
                 box.setValue(value)
                 box.blockSignals(False)
@@ -320,6 +382,11 @@ class ReconstructWidget(QWidget):
             return
         _status(self.spacing_label, choice.message)
         labels = self.labels_layer()
+        if len(choice.spacing) == 2:  # a 2-D mask: meshed in about a second, no estimate
+            _status(self.estimate_label, "A 2-D mask: meshed by delaunay-watershed-2d in about a second (no estimate).")
+            self.run_anyway.setVisible(False)
+            self.run_button.setEnabled(not busy)
+            return
         shape = labels.data[0].shape[-3:] if labels.multiscale else labels.data.shape[-3:]
         estimate = estimate_reconstruction(tuple(shape), choice.spacing)
         import psutil
@@ -369,8 +436,9 @@ class ReconstructWidget(QWidget):
             base_name = f"{labels.name} (medium = 0)"
             if base_name in self.viewer.layers:
                 self.viewer.layers.remove(base_name)
+            ndim = mask.ndim
             swapped = self.viewer.add_labels(
-                mask, name=base_name, scale=tuple(labels.scale[-3:]), translate=tuple(labels.translate[-3:])
+                mask, name=base_name, scale=tuple(labels.scale[-ndim:]), translate=tuple(labels.translate[-ndim:])
             )
             labels_for_display = swapped
         else:
@@ -388,6 +456,9 @@ class ReconstructWidget(QWidget):
             "spacing_unit": choice.unit,
             "min_distance": self.min_distance.value(),
         }
+        padding = self.padding_box.currentData()
+        if padding is not None:  # otherwise the library's own default call
+            kwargs["pad_thin_medium_margins"] = padding
 
         def reconstruct() -> Any:  # noqa: ANN401
             """In a worker thread: the reconstruction (a child process), its mesh and its layers' display copies."""
@@ -406,6 +477,7 @@ class ReconstructWidget(QWidget):
                 reconstruction=reconstruction,
                 rec_bytes=reconstruction.rec_bytes,
                 reconstruct_warnings=result.warnings_summary,
+                pad_thin_medium_margins=padding,
                 reconstruct_seconds=result.seconds,
                 peak_rss_bytes=result.peak_rss_bytes,
             )
@@ -422,7 +494,7 @@ class ReconstructWidget(QWidget):
             for name in install_layers(self.viewer, run, prepared_layers, labels_for_display, choice.spacing):
                 display.layers.append(self.viewer.layers[name])
             hidden = ""
-            if self.viewer.dims.ndisplay == 3 and labels_for_display.visible:
+            if mask.ndim == 3 and self.viewer.dims.ndisplay == 3 and labels_for_display.visible:
                 labels_for_display.visible = False  # in 3-D the labels' voxels hide the mesh
                 hidden = f" The labels layer '{labels_for_display.name}' is hidden (its voxels hide the mesh in 3-D)."
             self._finish(
@@ -573,7 +645,9 @@ class InferWidget(QWidget):
         self.tension_box.setCurrentText(tables.option_name(_signature_default(infer_forces, "mode_tension")))
         self.pressure_box = QComboBox()
         self.pressure_box.addItems(list(tables.PRESSURE_METHODS))
-        self.pressure_box.setCurrentText(tables.option_name(_signature_default(infer_forces, "mode_pressure")))
+        # The library's default is per dimension (None): variational for a 3-D mesh, laplace for a 2-D one.
+        self._dimension = 3
+        self.pressure_box.setCurrentText(tables.option_name(default_pressure_method(3)))
         self.pressures_box = QCheckBox("pressures (off: the tensions only, as foambryo infer --no-pressures)")
         self.pressures_box.setChecked(True)  # the library's infer_forces infers both
         self.mean_tension = QLineEdit(repr(float(_signature_default(infer_forces, "mean_tension"))))
@@ -591,6 +665,7 @@ class InferWidget(QWidget):
         self.combine_box = QComboBox()
         self.combine_box.addItems(list(COMBINE_OPTIONS))
         self.combine_box.setCurrentText(_signature_default(infer_tensions_over_seeds, "combine"))
+        self.one_mesh_reading_box = QComboBox()  # filled for the mesh's dimension (`_fill_readings`)
         self.reading_box = QComboBox()
         self.reading_box.addItems(list(ANGLE_READINGS))
         self.reading_box.setCurrentText(_signature_default(infer_tensions_over_seeds, "angle_reading"))
@@ -626,6 +701,7 @@ class InferWidget(QWidget):
         advanced_form.addRow("Base pressure (medium)", self.base_pressure)
         advanced_form.addRow("Solver", self.solver_box)
         advanced_form.addRow("Diagnostics", self.diagnostics_box)
+        advanced_form.addRow("Angle reading", self.one_mesh_reading_box)
         self.ensemble_advanced = QWidget()
         ensemble_advanced_form = QFormLayout(self.ensemble_advanced)
         ensemble_advanced_form.addRow("Combine", self.combine_box)
@@ -656,6 +732,7 @@ class InferWidget(QWidget):
         self.seeds_box.valueChanged.connect(self._mesh_changed)
         self.workers_box.valueChanged.connect(self._mesh_changed)
         self.pressures_box.toggled.connect(self._mesh_changed)
+        self._fill_readings(3)
         session_for(self.viewer).infer_form_options = self.options
         self.session.run_added.connect(self._refill)
         self.session.out_of_date.connect(self._refill)
@@ -693,8 +770,45 @@ class InferWidget(QWidget):
         """Whether the form is in seed-ensemble mode."""
         return self.mode_box.currentText() == self.ENSEMBLE
 
+    #: The one-mesh reading box's first item: the library's default for the mesh's dimension.
+    DEFAULT_READING = "the library's default ({})"
+
+    def _fill_readings(self, dimension: int) -> None:
+        """The one-mesh angle readings of a 3-D or 2-D mesh, the library's default first (`None`)."""
+        from foambryo import ANGLE_READINGS_2D, DEFAULT_ANGLE_READING_2D
+        from foambryo.second_order_angle_reading import ANGLE_READINGS, CHORD_READING
+
+        readings, default = ((ANGLE_READINGS, CHORD_READING) if dimension == 3
+                             else (ANGLE_READINGS_2D, DEFAULT_ANGLE_READING_2D))
+        self.one_mesh_reading_box.blockSignals(True)
+        self.one_mesh_reading_box.clear()
+        self.one_mesh_reading_box.addItem(self.DEFAULT_READING.format(default), None)
+        for reading in readings:
+            if reading != default:
+                self.one_mesh_reading_box.addItem(reading, reading)
+        self.one_mesh_reading_box.blockSignals(False)
+
+    def _follow_the_dimension(self, run: Run | None) -> None:
+        """The methods, readings and modes the mesh's dimension offers; the library's defaults when it changes."""
+        dimension = 3 if run is None else run_ndim(run)
+        tension_model, mode_model = self.tension_box.model(), self.mode_box.model()
+        for index, name in enumerate(tables.TENSION_METHODS):
+            tension_model.item(index).setEnabled(dimension == 3 or name == "young-dupre")
+        mode_model.item(1).setEnabled(dimension == 3)  # no seed ensemble in 2D: dw2d has no dither seed
+        if dimension == self._dimension:
+            return
+        self._dimension = dimension
+        self.tension_box.setCurrentText(tables.option_name(_signature_default(infer_forces, "mode_tension")))
+        self.pressure_box.setCurrentText(tables.option_name(default_pressure_method(dimension)))
+        if dimension == 2:
+            self.mode_box.blockSignals(True)
+            self.mode_box.setCurrentText(self.ONE_MESH)
+            self.mode_box.blockSignals(False)
+        self._fill_readings(dimension)
+
     def _mesh_changed(self, *_args: Any) -> None:  # noqa: ANN401
         run = RUNS.get(self.mesh_box.currentData() or "")
+        self._follow_the_dimension(run)
         ensemble = self.ensemble_mode()
         self.pressure_label.setVisible(not ensemble)
         self.pressure_box.setVisible(not ensemble)
@@ -705,13 +819,15 @@ class InferWidget(QWidget):
         self.ensemble_form.setVisible(ensemble)
         self.one_mesh_advanced.setVisible(not ensemble)
         self.ensemble_advanced.setVisible(ensemble)
-        cropped = run is not None and bool(np.any(run.mesh.crop_faces))
+        planar = run is not None and run_ndim(run) == 2
+        cropped = run is not None and not planar and bool(np.any(run.mesh.crop_faces))
         model = self.pressure_box.model()
-        for index, member in enumerate(tables.PRESSURE_METHODS.values()):
-            allowed = not cropped or member.has_crop_face_formulation
+        default = tables.option_name(default_pressure_method(2 if planar else 3))
+        for index, (name, member) in enumerate(tables.PRESSURE_METHODS.items()):
+            allowed = (name == default) if planar else (not cropped or member.has_crop_face_formulation)
             model.item(index).setEnabled(allowed)
             if not allowed and self.pressure_box.currentIndex() == index:
-                self.pressure_box.setCurrentText(tables.option_name(_signature_default(infer_forces, "mode_pressure")))
+                self.pressure_box.setCurrentText(default)
         possible = run is not None and (not ensemble or run.mask is not None)
         self.run_button.setEnabled(possible and self._worker is None)
         if run is None:
@@ -722,6 +838,12 @@ class InferWidget(QWidget):
                 "A seed ensemble reconstructs the mask again at each seed: it needs a mesh "
                 "reconstructed here, not one opened from a file.",
                 AMBER,
+            )
+        elif planar:
+            _status(
+                self.mesh_info,
+                "A 2-D mesh: Young-Dupré tensions read with the 2-D angle readings, each junction-graph component "
+                "gauged alone, and Laplace pressures (the methods offered in 2D); no seed ensemble.",
             )
         elif cropped and not ensemble:
             _status(
@@ -763,6 +885,7 @@ class InferWidget(QWidget):
             solver=self.solver_box.currentText(),
             diagnostics=self.diagnostics_box.currentText(),
             pressures=self.pressures_box.isChecked(),
+            angle_reading=self.one_mesh_reading_box.currentData(),
         )
 
     def ensemble_options(self) -> EnsembleOptions:
@@ -935,7 +1058,7 @@ def _show_one_result(layers: list) -> str:
     if "tensions" not in kinds:
         return ""
     for kind, layer in kinds.items():
-        if kind in ("cells", "pressures", "tensions"):
+        if kind in ("cells", "pressures", "tensions", "interfaces"):
             layer.visible = kind == "tensions"
     for layer in layers:  # the outlines of the tensions shown, not those of another inference
         info = layer.metadata.get("foambryo", {})
@@ -1057,7 +1180,8 @@ class ResultsWidget(QWidget):
         if run.options is not None and not run.options.pressures:
             self._fill(self.cells, ["the tensions only were inferred: no pressure was computed"], [])
         else:
-            columns = ["label", "pressure", "cut by the image box", "undetermined"]
+            cut_column = "on the image border" if run_ndim(run) == 2 else "cut by the image box"
+            columns = ["label", "pressure", cut_column, "undetermined"]
             if truth_p:
                 columns += ["true pressure"]
             rows = []
@@ -1338,6 +1462,7 @@ class ResultsWidget(QWidget):
                 "tensions",
                 "pressures",
                 "ensemble tensions",
+                "interfaces",
             ):
                 other.visible = other is layer
 
@@ -1647,6 +1772,16 @@ class ViewWidget(QWidget):
             return
         if self.info.text().endswith("first."):  # the message of no run is no longer true
             _status(self.info, "")
+        run = self.shared.run()
+        if run is not None and run_ndim(run) == 2:  # a 2-D tissue is seen whole: no cut
+            if self.cut_box.isChecked() or display.cut is not None:
+                self.cut_box.blockSignals(True)
+                self.cut_box.setChecked(False)
+                self.cut_box.blockSignals(False)
+                display.cut = None
+            self.cut_box.setEnabled(False)
+            self._show_cut_controls(False)
+            _status(self.info, "A 2-D tissue: Explode moves each cell away from the tissue's centre; there is no cut.")
         self.explode_slider.blockSignals(True)
         self.explode_slider.setValue(round(display.explode * self.EXPLODE_STEPS))
         self.explode_slider.blockSignals(False)
@@ -1799,9 +1934,9 @@ class ViewWidget(QWidget):
                 scale = np.asarray(display.source_layer.scale[-3:])
                 translate = np.asarray(display.source_layer.translate[-3:])
                 self._bounds = np.stack([translate, translate + (shape - 1) * scale])
-        if self._bounds is None:
-            return 0.0, 1.0
         axis = self.axis_box.currentIndex()
+        if self._bounds is None or self._bounds.shape[1] != 3:  # no box, or a 2-D one (no cut in 2D)
+            return 0.0, 1.0
         return float(self._bounds[0, axis]), float(self._bounds[1, axis])
 
     def _position(self) -> float:

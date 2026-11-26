@@ -321,3 +321,111 @@ def _tension_of(tensions: dict[tuple[int, int], float], key: tuple[int, int]) ->
         return float(tensions[key])
     reverse = (key[1], key[0])
     return float(tensions[reverse]) if reverse in tensions else float("nan")
+
+
+# ---------------------------------------------------------------------------------------------
+# 2-D meshes: cells as filled polygons, interfaces as thin ribbons, both as napari Surface layers
+# ---------------------------------------------------------------------------------------------
+#: The width of a 2-D interface's ribbon, in pixels of the mesh's image (a membrane drawn one pixel wide).
+RIBBON_WIDTH_PX = 1.0
+
+
+def is_planar(mesh: object) -> bool:
+    """Whether `mesh` is a 2-D mesh (foambryo's `PlanarMesh` or another 2-D mesh), not a 3-D `DcelData`."""
+    if hasattr(mesh, "f"):
+        return False
+    from foambryo import dimension_of
+
+    return dimension_of(mesh) == 2
+
+
+def planar_scene_of(mesh: object) -> object:
+    """foambryo's drawing of a 2-D mesh: its cells as triangles, its interfaces, its image-border segments.
+
+    (`foambryo.plotting_utilities.planar_mesh_drawing`, shared with foambryo's Polyscope window.)
+    """
+    from foambryo.plotting_utilities import planar_mesh_drawing
+
+    return planar_mesh_drawing(mesh)
+
+
+def _pixel_size(mesh: object) -> float:
+    spacing = getattr(mesh, "spacing", None)
+    return float(spacing) if spacing else 1.0
+
+
+def planar_cell_copy(mesh: object, scene: object | None = None) -> DisplayCopy:
+    """Each cell of a 2-D mesh as its own filled polygon (its triangles, each vertex once per cell).
+
+    `source_triangle` is the index of the triangle in the scene's `triangles`; `vertex_group` and `vertex_cell` are the
+    cell. The polygons are exact for non-convex cells (ear clipping, `foambryo.plotting_utilities.planar_mesh_drawing`).
+    """
+    scene = planar_scene_of(mesh) if scene is None else scene
+    rows = np.arange(len(scene.triangles))
+    copy = _copy_by_group(np.asarray(scene.points, dtype=np.float64), np.asarray(scene.triangles, dtype=np.int64),
+                          rows, np.asarray(scene.triangle_cell, dtype=np.int64))
+    return DisplayCopy(copy.vertices, copy.faces, copy.source_vertex, copy.source_triangle, copy.vertex_group,
+                       copy.face_group, vertex_cell=copy.vertex_group)
+
+
+def _ribbons(points: NDArray[np.float64], segments: NDArray[np.int64], width: float) -> tuple[NDArray, NDArray]:
+    """Each segment as a quad of `width`: four vertices (two at each end, either side) and two triangles."""
+    a, b = points[segments[:, 0]], points[segments[:, 1]]
+    direction = b - a
+    length = np.linalg.norm(direction, axis=1, keepdims=True)
+    normal = np.c_[-direction[:, 1], direction[:, 0]] / np.where(length > 0, length, 1.0)
+    half = 0.5 * width * normal
+    vertices = np.stack([a - half, a + half, b - half, b + half], axis=1).reshape(-1, 2)
+    base = 4 * np.arange(len(segments))[:, None]
+    faces = np.concatenate([base + np.array([0, 2, 1]), base + np.array([1, 2, 3])], axis=1).reshape(-1, 3)
+    return vertices, faces
+
+
+def planar_interface_copy(
+    mesh: object, scene: object | None = None, *, exploded: bool = False, border: bool = False
+) -> tuple[DisplayCopy, list[tuple[int, int]]]:
+    """A 2-D mesh's interfaces as ribbons one pixel wide: one quad per segment, its group the segment's interface.
+
+    Exploded, each segment is drawn once per cell on either side (the medium has none), and `vertex_cell` is that
+    cell. `border` gives the image-border segments instead (which close a cut cell; no value), `vertex_cell` their
+    cell. `source_vertex` is the mesh vertex at each quad corner, `source_triangle` the segment.
+
+    Returns:
+        tuple: the copy, and the interfaces `(label_1, label_2)` (the groups index them).
+    """
+    scene = planar_scene_of(mesh) if scene is None else scene
+    keys = [tuple(pair) for pair in scene.pairs]
+    if border:
+        rows = np.flatnonzero(scene.border)
+        cells = scene.labels[rows, 1]
+    elif exploded:
+        rows, cells = scene.interface_sides()
+        keep = ~scene.border[rows]
+        rows, cells = rows[keep], cells[keep]
+    else:
+        rows = np.flatnonzero(~scene.border)
+        cells = None
+    vertices, faces = _ribbons(np.asarray(scene.points, dtype=np.float64), scene.segments[rows],
+                               RIBBON_WIDTH_PX * _pixel_size(mesh))
+    groups = np.repeat(scene.segment_pair[rows], 4)
+    copy = DisplayCopy(
+        vertices=vertices,
+        faces=faces.astype(np.int64),
+        source_vertex=scene.segments[rows][:, [0, 0, 1, 1]].reshape(-1).astype(np.int64),
+        source_triangle=np.repeat(rows, 2).astype(np.int64),
+        vertex_group=groups.astype(np.int64),
+        face_group=np.repeat(scene.segment_pair[rows], 2).astype(np.int64),
+        vertex_cell=None if cells is None else np.repeat(cells, 4).astype(np.int64),
+    )
+    return copy, keys
+
+
+def planar_directions(mesh: object, scene: object | None = None) -> NDArray[np.float64]:
+    """Each label's move in the exploded view at `coeff = 1`, `(max label + 1, 2)`: its area centroid minus the
+    tissue's (`foambryo.plotting_utilities.PlanarMeshDrawing.displacements`); the medium's row is zero."""
+    scene = planar_scene_of(mesh) if scene is None else scene
+    labels = np.asarray(scene.labels, dtype=np.int64)
+    out = np.zeros((int(labels.max(initial=0)) + 1, 2), dtype=np.float64)
+    for label, displacement in scene.displacements(1.0).items():
+        out[int(label)] = displacement
+    return out

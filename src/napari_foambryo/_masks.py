@@ -5,12 +5,14 @@ accepts, and how, is decided here, without Qt, so that it can be tested alone:
 
 * the full-resolution level of a multiscale layer;
 * a lazy array (dask, zarr) read into memory;
-* a leading axis of length 1 (time or channel) dropped, with a note;
+* a leading axis of length 1 (time or channel) dropped, with a note: a 4-D layer `(1, Z, Y, X)` gives a 3-D mask, a
+  3-D layer `(1, Y, X)` (one plane) a 2-D one;
+* a 2-D layer `(Y, X)`: a 2-D mask, meshed in 2D (delaunay-watershed-2d) and inferred in 2D;
 * any integer type, labels not consecutive (a label is a name, and it is kept);
 * the medium label swapped with 0 when the user says the medium is another label.
 
-Refused, with the reason: several time points, 2-D data, floating-point or boolean data, negative labels (the
-library's own checks, `foambryo.segmentation_masks.check_segmentation_mask`). Nothing else is changed.
+Refused, with the reason: several time points, floating-point or boolean data, negative labels (the library's own
+checks, `foambryo.segmentation_masks.check_segmentation_mask`). Nothing else is changed.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ class PreparedMask:
     """The mask to reconstruct, and what was done to get it from the layer's data.
 
     Attributes:
-        mask: the 3-D integer mask, axes (z, y, x).
+        mask: the 3-D integer mask, axes (z, y, x), or the 2-D one, axes (y, x).
         notes: one sentence per accommodation, shown to the user and written into `run.json`.
         dropped_leading_axis: whether a leading axis of length 1 was dropped.
         multiscale_level: the level read from a multiscale layer (0, the full resolution), else `None`.
@@ -54,7 +56,7 @@ def prepare_mask(data: Any, *, multiscale: bool = False, name: str = "the layer"
         PreparedMask: the mask and the notes.
 
     Raises:
-        SegmentationMaskError: for several time points, 2-D data, non-integer data or negative labels.
+        SegmentationMaskError: for several time points, non-integer data or negative labels.
     """
     notes: list[str] = []
     level = None
@@ -77,6 +79,11 @@ def prepare_mask(data: Any, *, multiscale: bool = False, name: str = "the layer"
         array = array[0]
         dropped = True
         notes.append(f"{name} has a leading axis of length 1: it was dropped, shape {tuple(array.shape)}")
+    elif array.ndim == 3 and array.shape[0] == 1:
+        array = array[0]
+        dropped = True
+        notes.append(f"{name} holds one plane (a leading axis of length 1): it was dropped, and the 2-D mask "
+                     f"{tuple(array.shape)} is meshed in 2D")
     mask = check_segmentation_mask(array, name=name)
     return PreparedMask(mask=mask, notes=tuple(notes), dropped_leading_axis=dropped, multiscale_level=level)
 

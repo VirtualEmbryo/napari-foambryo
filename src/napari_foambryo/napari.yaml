@@ -38,6 +38,18 @@ contributions:
     - id: napari-foambryo.sample_foam_cropped
       title: Generated foam, cut by the image box
       python_name: napari_foambryo._sample_data:foam_cropped
+    - id: napari-foambryo.sample_two_dimensional_foam
+      title: 2-D foam with known tensions
+      python_name: napari_foambryo._sample_data:two_dimensional_foam
+    - id: napari-foambryo.sample_c_elegans_with_eggshell
+      title: C. elegans 4-cell, with eggshell (2-D)
+      python_name: napari_foambryo._sample_data:c_elegans_4_cell_with_eggshell
+    - id: napari-foambryo.sample_c_elegans_without_eggshell
+      title: C. elegans 4-cell, without eggshell (2-D)
+      python_name: napari_foambryo._sample_data:c_elegans_4_cell_without_eggshell
+    - id: napari-foambryo.sample_c_elegans_rnai
+      title: C. elegans 4-cell, hmr-1; hmp-2 RNAi (2-D)
+      python_name: napari_foambryo._sample_data:c_elegans_rnai_frame
   widgets:
     - command: napari-foambryo.reconstruct_widget
       display_name: Reconstruct
@@ -74,3 +86,15 @@ contributions:
     - key: foam_cropped
       display_name: Generated foam (cut by the image box)
       command: napari-foambryo.sample_foam_cropped
+    - key: two_dimensional_foam
+      display_name: 2-D foam (8 cells, true tensions known)
+      command: napari-foambryo.sample_two_dimensional_foam
+    - key: c_elegans_4_cell_with_eggshell
+      display_name: 2-D C. elegans 4-cell embryo, with eggshell (image and cells)
+      command: napari-foambryo.sample_c_elegans_with_eggshell
+    - key: c_elegans_4_cell_without_eggshell
+      display_name: 2-D C. elegans 4-cell embryo, without eggshell (image and cells)
+      command: napari-foambryo.sample_c_elegans_without_eggshell
+    - key: c_elegans_rnai
+      display_name: 2-D C. elegans 4-cell embryo, hmr-1; hmp-2 RNAi (image and cells)
+      command: napari-foambryo.sample_c_elegans_rnai
